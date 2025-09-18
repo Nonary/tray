@@ -73,6 +73,28 @@ static LRESULT CALLBACK _tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARA
     case WM_DESTROY:
       PostQuitMessage(0);
       return 0;
+    case WM_COMMAND: {
+      if (HIWORD(wparam) == 0) {
+        const UINT cmd_id = LOWORD(wparam);
+        MENUITEMINFOA item_info;
+        memset(&item_info, 0, sizeof(item_info));
+        item_info.cbSize = sizeof(item_info);
+        item_info.fMask = MIIM_DATA | MIIM_STATE;
+        if (GetMenuItemInfoA(hmenu, cmd_id, FALSE, &item_info) && item_info.dwItemData != 0) {
+          struct tray_menu *menu = (struct tray_menu *) item_info.dwItemData;
+          if (menu->checkbox) {
+            menu->checked = !menu->checked;
+            item_info.fMask = MIIM_STATE;
+            item_info.fState = menu->checked ? MFS_CHECKED : 0;
+            SetMenuItemInfoA(hmenu, cmd_id, FALSE, &item_info);
+          }
+          if (menu->cb) {
+            menu->cb(menu);
+          }
+        }
+      }
+      return 0;
+    }
     case WM_TRAY_CALLBACK_MESSAGE: {
       switch (LOWORD(lparam)) {
         case WM_LBUTTONUP:

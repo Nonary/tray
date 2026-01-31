@@ -13,6 +13,8 @@
 #define ARRAYSIZE(a) (sizeof(a)/sizeof((a)[0]))
 #endif
 // std C
+#include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -55,6 +57,42 @@ static const GUID kTrayGuid =
 
 static struct icon_info *icon_infos;
 static HMENU _tray_menu(struct tray_menu *m, UINT *id);
+
+static tray_log_callback g_tray_log_cb = NULL;
+
+void tray_set_log_callback(tray_log_callback cb) {
+  g_tray_log_cb = cb;
+}
+
+static void tray_log(enum tray_log_level level, const char *fmt, ...) {
+  if (!g_tray_log_cb || !fmt) {
+    return;
+  }
+  char buffer[1024];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buffer, sizeof(buffer), fmt, args);
+  va_end(args);
+  buffer[sizeof(buffer) - 1] = '\0';
+  g_tray_log_cb(level, buffer);
+}
+
+static void tray_log_last_error(enum tray_log_level level, const char *context) {
+  DWORD err = GetLastError();
+  char message[512] = {0};
+  DWORD flags = FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS;
+  DWORD len = FormatMessageA(flags, NULL, err, 0, message, (DWORD)sizeof(message), NULL);
+  if (len == 0 || message[0] == '\0') {
+    tray_log(level, "%s failed (err=%lu; no extended error message)", context, (unsigned long)err);
+  } else {
+    // Trim trailing newlines from FormatMessageA
+    while (len > 0 && (message[len - 1] == '\n' || message[len - 1] == '\r')) {
+      message[len - 1] = '\0';
+      --len;
+    }
+    tray_log(level, "%s failed (err=%lu): %s", context, (unsigned long)err, message);
+  }
+}
 
 // Safe copy that always NUL-terminates
 static void safe_copy_sz(char *dst, size_t dstcch, const char *src) {
@@ -278,12 +316,14 @@ int tray_init(struct tray *tray) {
   wc.hInstance = GetModuleHandle(NULL);
   wc.lpszClassName = WC_TRAY_CLASS_NAME;
   if (!RegisterClassExA(&wc)) {
+    tray_log_last_error(TRAY_LOG_ERROR, "RegisterClassExA");
     return -1;
   }
 
   // Hidden top-level window (NOT message-only) is safest for Shell_NotifyIcon callbacks.
   hwnd = CreateWindowExA(0, WC_TRAY_CLASS_NAME, NULL, 0, 0, 0, 0, 0, NULL, NULL, GetModuleHandle(NULL), NULL);
   if (hwnd == NULL) {
+    tray_log_last_error(TRAY_LOG_ERROR, "CreateWindowExA");
     UnregisterClassA(WC_TRAY_CLASS_NAME, GetModuleHandle(NULL));
     return -1;
   }
@@ -299,6 +339,7 @@ int tray_init(struct tray *tray) {
   nid.uFlags = NIF_MESSAGE | NIF_GUID;
   nid.uCallbackMessage = WM_TRAY_CALLBACK_MESSAGE;
   if (!Shell_NotifyIconA(NIM_ADD, &nid)) {
+    tray_log_last_error(TRAY_LOG_ERROR, "Shell_NotifyIconA(NIM_ADD)");
     DestroyWindow(hwnd);
     hwnd = NULL;
     UnregisterClassA(WC_TRAY_CLASS_NAME, GetModuleHandle(NULL));
@@ -307,7 +348,9 @@ int tray_init(struct tray *tray) {
 
   // Opt into the modern notify icon behavior for reliable balloon/toast events
   nid.uVersion = NOTIFYICON_VERSION_4;
-  Shell_NotifyIconA(NIM_SETVERSION, &nid);
+  if (!Shell_NotifyIconA(NIM_SETVERSION, &nid)) {
+    tray_log_last_error(TRAY_LOG_WARNING, "Shell_NotifyIconA(NIM_SETVERSION)");
+  }
 
   tray_update(tray);
   return 0;
@@ -319,6 +362,9 @@ int tray_loop(int blocking) {
     // Get thread-wide messages so we receive WM_QUIT too
     BOOL r = GetMessageA(&msg, NULL, 0, 0);
     if (r <= 0) {
+      if (r == -1) {
+        tray_log_last_error(TRAY_LOG_ERROR, "GetMessageA");
+      }
       return -1; // error or WM_QUIT
     }
     TranslateMessage(&msg);
@@ -407,7 +453,9 @@ void tray_update(struct tray *tray) {
 
   // Apply the freshly computed flags for this modification (prevents stale NIF_* carry-over)
   nid.uFlags = flags;
-  Shell_NotifyIconA(NIM_MODIFY, &nid);
+  if (!Shell_NotifyIconA(NIM_MODIFY, &nid)) {
+    tray_log_last_error(TRAY_LOG_WARNING, "Shell_NotifyIconA(NIM_MODIFY)");
+  }
 
   if (prevmenu != NULL) {
     DestroyMenu(prevmenu);

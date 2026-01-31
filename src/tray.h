@@ -8,6 +8,25 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+  /**
+   * @brief Log severity for tray backend messages.
+   */
+  enum tray_log_level {
+    TRAY_LOG_DEBUG = 0,
+    TRAY_LOG_INFO = 1,
+    TRAY_LOG_WARNING = 2,
+    TRAY_LOG_ERROR = 3
+  };
+
+  /**
+   * @brief Callback signature for tray backend logging.
+   */
+  typedef void (*tray_log_callback)(enum tray_log_level level, const char *message);
+
+  /**
+   * @brief Set log callback for tray backend messages.
+   */
+  void tray_set_log_callback(tray_log_callback cb);
 
   /**
    * @brief Tray menu item.

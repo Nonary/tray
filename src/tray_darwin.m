@@ -3,6 +3,8 @@
  * @brief System tray implementation for macOS.
  */
 // standard includes
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 // lib includes
@@ -40,6 +42,25 @@ static NSApplication *app;
 static NSStatusBar *statusBar;
 static NSStatusItem *statusItem;
 
+static tray_log_callback g_tray_log_cb = NULL;
+
+void tray_set_log_callback(tray_log_callback cb) {
+  g_tray_log_cb = cb;
+}
+
+static void tray_log(enum tray_log_level level, const char *fmt, ...) {
+  if (!g_tray_log_cb || !fmt) {
+    return;
+  }
+  char buffer[1024];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buffer, sizeof(buffer), fmt, args);
+  va_end(args);
+  buffer[sizeof(buffer) - 1] = '\0';
+  g_tray_log_cb(level, buffer);
+}
+
 static NSMenu *_tray_menu(struct tray_menu *m) {
   NSMenu *menu = [[NSMenu alloc] init];
   [menu setAutoenablesItems:FALSE];
@@ -70,6 +91,10 @@ int tray_init(struct tray *tray) {
   [app setDelegate:delegate];
   statusBar = [NSStatusBar systemStatusBar];
   statusItem = [statusBar statusItemWithLength:NSVariableStatusItemLength];
+  if (statusBar == nil || statusItem == nil) {
+    tray_log(TRAY_LOG_ERROR, "Failed to initialize NSStatusBar/NSStatusItem");
+    return -1;
+  }
   tray_update(tray);
   [app activateIgnoringOtherApps:TRUE];
   return 0;
@@ -90,6 +115,10 @@ int tray_loop(int blocking) {
 void tray_update(struct tray *tray) {
   NSImage *image = [[NSImage alloc] initWithContentsOfFile:[NSString stringWithUTF8String:tray->icon]];
   NSSize size = NSMakeSize(16, 16);
+  if (image == nil) {
+    tray_log(TRAY_LOG_WARNING, "Failed to load tray icon image");
+    return;
+  }
   [image setSize:NSMakeSize(16, 16)];
   statusItem.button.image = image;
   [statusItem setMenu:_tray_menu(tray->menu)];

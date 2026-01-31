@@ -5,6 +5,8 @@
 // standard includes
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 // lib includes
@@ -29,6 +31,25 @@ static pthread_mutex_t async_update_mutex = PTHREAD_MUTEX_INITIALIZER;
 static AppIndicator *indicator = NULL;
 static int loop_result = 0;
 static NotifyNotification *currentNotification = NULL;
+
+static tray_log_callback g_tray_log_cb = NULL;
+
+void tray_set_log_callback(tray_log_callback cb) {
+  g_tray_log_cb = cb;
+}
+
+static void tray_log(enum tray_log_level level, const char *fmt, ...) {
+  if (!g_tray_log_cb || !fmt) {
+    return;
+  }
+  char buffer[1024];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buffer, sizeof(buffer), fmt, args);
+  va_end(args);
+  buffer[sizeof(buffer) - 1] = '\0';
+  g_tray_log_cb(level, buffer);
+}
 
 static void _tray_menu_cb(GtkMenuItem *item, gpointer data) {
   (void) item;
@@ -65,11 +86,15 @@ static GtkMenuShell *_tray_menu(struct tray_menu *m) {
 
 int tray_init(struct tray *tray) {
   if (gtk_init_check(0, NULL) == FALSE) {
+    tray_log(TRAY_LOG_ERROR, "gtk_init_check() failed");
     return -1;
   }
-  notify_init("tray-icon");
+  if (!notify_init("tray-icon")) {
+    tray_log(TRAY_LOG_WARNING, "notify_init() failed");
+  }
   indicator = app_indicator_new(TRAY_APPINDICATOR_ID, tray->icon, APP_INDICATOR_CATEGORY_APPLICATION_STATUS);
   if (indicator == NULL || !IS_APP_INDICATOR(indicator)) {
+    tray_log(TRAY_LOG_ERROR, "app_indicator_new() failed");
     return -1;
   }
   app_indicator_set_status(indicator, APP_INDICATOR_STATUS_ACTIVE);
@@ -102,7 +127,9 @@ static gboolean tray_update_internal(gpointer user_data) {
       if (tray->notification_cb != NULL) {
         notify_notification_add_action(currentNotification, "default", "Default", NOTIFY_ACTION_CALLBACK(tray->notification_cb), NULL, NULL);
       }
-      notify_notification_show(currentNotification, NULL);
+      if (!notify_notification_show(currentNotification, NULL)) {
+        tray_log(TRAY_LOG_WARNING, "notify_notification_show() failed");
+      }
     }
   }
 

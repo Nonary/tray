@@ -51,12 +51,10 @@ static HMENU hmenu = NULL;
 static void (*notification_cb)() = 0;
 static UINT wm_taskbarcreated;
 static struct tray *g_tray = NULL;  // remember last tray so we can re-apply after Explorer restarts
-// Stable identity for our notify icon (helps after Explorer restarts and avoids duplicates).
-static const GUID kTrayGuid =
-  {0xC1A1C4E1, 0x7C42, 0x4DB4, {0x93, 0xB4, 0x2E, 0x9E, 0x0D, 0x7A, 0x8E, 0x31}};
 
 static struct icon_info *icon_infos;
 static HMENU _tray_menu(struct tray_menu *m, UINT *id);
+static HICON _fetch_icon(const char *path, enum IconType icon_type);
 
 static tray_log_callback g_tray_log_cb = NULL;
 
@@ -102,6 +100,45 @@ static void safe_copy_sz(char *dst, size_t dstcch, const char *src) {
 }
 
 static int icon_info_count;
+
+static DWORD tray_apply_icon_and_tip(struct tray *tray, DWORD flags) {
+  nid.hIcon = NULL;
+  if (tray != NULL && tray->icon != NULL && tray->icon[0] != '\0') {
+    HICON icon = _fetch_icon(tray->icon, REGULAR);
+    if (icon != NULL) {
+      nid.hIcon = icon;
+      flags |= NIF_ICON;
+    }
+  }
+
+  if (tray != NULL && tray->tooltip != NULL && tray->tooltip[0] != '\0') {
+    safe_copy_sz(nid.szTip, ARRAYSIZE(nid.szTip), tray->tooltip);
+    flags |= NIF_TIP;
+#ifdef NIF_SHOWTIP
+    flags |= NIF_SHOWTIP;
+#endif
+  } else {
+    nid.szTip[0] = '\0';
+  }
+
+  return flags;
+}
+
+static int tray_add_notify_icon(struct tray *tray, enum tray_log_level failure_level) {
+  nid.uFlags = tray_apply_icon_and_tip(tray, NIF_MESSAGE);
+  nid.uCallbackMessage = WM_TRAY_CALLBACK_MESSAGE;
+  if (!Shell_NotifyIconA(NIM_ADD, &nid)) {
+    tray_log_last_error(failure_level, "Shell_NotifyIconA(NIM_ADD)");
+    return -1;
+  }
+
+  nid.uVersion = NOTIFYICON_VERSION_4;
+  if (!Shell_NotifyIconA(NIM_SETVERSION, &nid)) {
+    tray_log_last_error(TRAY_LOG_WARNING, "Shell_NotifyIconA(NIM_SETVERSION)");
+  }
+
+  return 0;
+}
 
 static LRESULT CALLBACK _tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
   switch (msg) {
@@ -165,12 +202,7 @@ static LRESULT CALLBACK _tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARA
 
   // Handle Explorer restarts: re-add icon, set version, and re-apply state.
   if (msg == wm_taskbarcreated) {
-    nid.uFlags = NIF_MESSAGE | NIF_GUID;
-    nid.uCallbackMessage = WM_TRAY_CALLBACK_MESSAGE; // keep callback current
-    Shell_NotifyIconA(NIM_ADD, &nid);
-    nid.uVersion = NOTIFYICON_VERSION_4;
-    Shell_NotifyIconA(NIM_SETVERSION, &nid);
-    if (g_tray) {
+    if (g_tray && tray_add_notify_icon(g_tray, TRAY_LOG_WARNING) == 0) {
       // Rebuild menu and re-apply state
       UINT id = ID_TRAY_FIRST;
       HMENU prevmenu = hmenu;
@@ -309,6 +341,7 @@ int tray_init(struct tray *tray) {
   wm_taskbarcreated = RegisterWindowMessageA("TaskbarCreated");
 
   _init_icon_cache(tray->allIconPaths, tray->iconPathCount);
+  g_tray = tray;
 
   memset(&wc, 0, sizeof(wc));
   wc.cbSize = sizeof(WNDCLASSEXA);
@@ -317,6 +350,8 @@ int tray_init(struct tray *tray) {
   wc.lpszClassName = WC_TRAY_CLASS_NAME;
   if (!RegisterClassExA(&wc)) {
     tray_log_last_error(TRAY_LOG_ERROR, "RegisterClassExA");
+    _destroy_icon_cache();
+    g_tray = NULL;
     return -1;
   }
 
@@ -324,6 +359,8 @@ int tray_init(struct tray *tray) {
   hwnd = CreateWindowExA(0, WC_TRAY_CLASS_NAME, NULL, 0, 0, 0, 0, 0, NULL, NULL, GetModuleHandle(NULL), NULL);
   if (hwnd == NULL) {
     tray_log_last_error(TRAY_LOG_ERROR, "CreateWindowExA");
+    _destroy_icon_cache();
+    g_tray = NULL;
     UnregisterClassA(WC_TRAY_CLASS_NAME, GetModuleHandle(NULL));
     return -1;
   }
@@ -333,23 +370,14 @@ int tray_init(struct tray *tray) {
   nid.cbSize = sizeof(NOTIFYICONDATAA);
   nid.hWnd = hwnd;
   nid.uID = 1; // non-zero id
-  nid.guidItem = kTrayGuid;
 
-  // Add with message callback; icon will be set in tray_update below.
-  nid.uFlags = NIF_MESSAGE | NIF_GUID;
-  nid.uCallbackMessage = WM_TRAY_CALLBACK_MESSAGE;
-  if (!Shell_NotifyIconA(NIM_ADD, &nid)) {
-    tray_log_last_error(TRAY_LOG_ERROR, "Shell_NotifyIconA(NIM_ADD)");
+  if (tray_add_notify_icon(tray, TRAY_LOG_ERROR) < 0) {
     DestroyWindow(hwnd);
     hwnd = NULL;
+    _destroy_icon_cache();
+    g_tray = NULL;
     UnregisterClassA(WC_TRAY_CLASS_NAME, GetModuleHandle(NULL));
     return -1;
-  }
-
-  // Opt into the modern notify icon behavior for reliable balloon/toast events
-  nid.uVersion = NOTIFYICON_VERSION_4;
-  if (!Shell_NotifyIconA(NIM_SETVERSION, &nid)) {
-    tray_log_last_error(TRAY_LOG_WARNING, "Shell_NotifyIconA(NIM_SETVERSION)");
   }
 
   tray_update(tray);
@@ -384,35 +412,19 @@ int tray_loop(int blocking) {
 }
 
 void tray_update(struct tray *tray) {
+  if (tray == NULL || hwnd == NULL) {
+    return;
+  }
+
   g_tray = tray; // remember the last state for re-adding after Explorer restarts
   UINT id = ID_TRAY_FIRST;
   HMENU prevmenu = hmenu;
   hmenu = _tray_menu(tray->menu, &id);
   SendMessage(hwnd, WM_INITMENUPOPUP, (WPARAM) hmenu, 0);
 
-  HICON icon = _fetch_icon(tray->icon, REGULAR);
-  
   // Rebuild flags each update to avoid stale bits carrying over
-  DWORD flags = NIF_MESSAGE | NIF_GUID;
+  DWORD flags = tray_apply_icon_and_tip(tray, NIF_MESSAGE);
 
-  if (icon != NULL) {
-    nid.hIcon = icon;
-    flags |= NIF_ICON;
-  }
-
-  if (tray->tooltip != 0 && strlen(tray->tooltip) > 0) {
-    strncpy(nid.szTip, tray->tooltip, sizeof(nid.szTip));
-    nid.szTip[sizeof(nid.szTip) - 1] = '\0';
-    flags |= NIF_TIP;
-#ifdef NIF_SHOWTIP
-    // With NOTIFYICON_VERSION_4, standard tooltip can be suppressed unless NIF_SHOWTIP is set.
-    flags |= NIF_SHOWTIP;
-#endif
-  } else {
-    nid.szTip[0] = '\0';
-  }
-
-  
   // Balloon/toast (legacy surface mapped to Win10+ toasts)
   const BOOL has_title = (tray->notification_title && tray->notification_title[0]);
   const BOOL has_text  = (tray->notification_text  && tray->notification_text[0]);
@@ -426,10 +438,7 @@ void tray_update(struct tray *tray) {
     // Prefer a user-provided notification icon; else fall back to the tray icon.
     HICON hLarge = NULL;
     if (tray->notification_icon && tray->notification_icon[0]) {
-      hLarge = (HICON)LoadImageA(NULL, tray->notification_icon, IMAGE_ICON,
-                                 GetSystemMetrics(SM_CXICON) * 2,
-                                 GetSystemMetrics(SM_CYICON) * 2,
-                                 LR_LOADFROMFILE);
+      hLarge = _fetch_icon(tray->notification_icon, NOTIFICATION);
     }
     if (!hLarge && nid.hIcon) {
       hLarge = nid.hIcon;
@@ -446,6 +455,7 @@ void tray_update(struct tray *tray) {
     nid.szInfoTitle[0] = '\0';
     nid.szInfo[0]      = '\0';
     nid.dwInfoFlags    = NIIF_NONE;
+    nid.hBalloonIcon   = NULL;
   }
 
   // Keep the callback up-to-date regardless of Focus Assist state
@@ -463,11 +473,18 @@ void tray_update(struct tray *tray) {
 }
 
 void tray_exit(void) {
+  g_tray = NULL;
   Shell_NotifyIconA(NIM_DELETE, &nid);
   _destroy_icon_cache();
+  if (hwnd != NULL) {
+    DestroyWindow(hwnd);
+    hwnd = NULL;
+  }
   if (hmenu != 0) {
     DestroyMenu(hmenu);
+    hmenu = NULL;
   }
-  PostQuitMessage(0);
+  notification_cb = NULL;
+  memset(&nid, 0, sizeof(nid));
   UnregisterClassA(WC_TRAY_CLASS_NAME, GetModuleHandle(NULL));
 }

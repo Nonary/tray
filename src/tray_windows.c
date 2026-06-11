@@ -24,6 +24,9 @@
 #define WM_TRAY_CALLBACK_MESSAGE (WM_USER + 1)  ///< Tray callback message.
 #define WC_TRAY_CLASS_NAME "TRAY"  ///< Tray window class name.
 #define ID_TRAY_FIRST 1000  ///< First tray identifier.
+#define ID_TRAY_RETRY_TIMER 1  ///< Timer that retries notification icon registration.
+#define TRAY_RETRY_INTERVAL_MS 5000  ///< Interval between icon registration retries.
+#define TRAY_RETRY_LOG_PERIOD 60  ///< Log a retry failure at WARNING once per this many attempts.
 
 /**
  * @brief Icon information.
@@ -52,9 +55,13 @@ static void (*notification_cb)() = 0;
 static UINT wm_taskbarcreated;
 static struct tray *g_tray = NULL;  // remember last tray so we can re-apply after Explorer restarts
 
+static BOOL icon_added = FALSE;  // whether the shell currently has our notification icon
+static unsigned int icon_add_failures = 0;
+
 static struct icon_info *icon_infos;
 static HMENU _tray_menu(struct tray_menu *m, UINT *id);
 static HICON _fetch_icon(const char *path, enum IconType icon_type);
+static int tray_try_add_icon(void);
 
 static tray_log_callback g_tray_log_cb = NULL;
 
@@ -128,8 +135,13 @@ static int tray_add_notify_icon(struct tray *tray, enum tray_log_level failure_l
   nid.uFlags = tray_apply_icon_and_tip(tray, NIF_MESSAGE);
   nid.uCallbackMessage = WM_TRAY_CALLBACK_MESSAGE;
   if (!Shell_NotifyIconA(NIM_ADD, &nid)) {
-    tray_log_last_error(failure_level, "Shell_NotifyIconA(NIM_ADD)");
-    return -1;
+    // The shell may still be tracking a half-registered icon for this identity
+    // (e.g. a previous instance that died mid-update). Clear it and try once more.
+    Shell_NotifyIconA(NIM_DELETE, &nid);
+    if (!Shell_NotifyIconA(NIM_ADD, &nid)) {
+      tray_log_last_error(failure_level, "Shell_NotifyIconA(NIM_ADD)");
+      return -1;
+    }
   }
 
   nid.uVersion = NOTIFYICON_VERSION_4;
@@ -140,6 +152,59 @@ static int tray_add_notify_icon(struct tray *tray, enum tray_log_level failure_l
   return 0;
 }
 
+static void tray_schedule_icon_retry(void) {
+  if (hwnd != NULL) {
+    SetTimer(hwnd, ID_TRAY_RETRY_TIMER, TRAY_RETRY_INTERVAL_MS, NULL);
+  }
+}
+
+// Try to (re-)register the notification icon. The shell can refuse NIM_ADD for
+// long stretches (around logon, Explorer crashes, installer-driven restarts), so
+// failures are not fatal: a timer keeps retrying until the shell accepts. Failure
+// logs are throttled to one WARNING per TRAY_RETRY_LOG_PERIOD attempts so a
+// persistently broken shell does not flood the log.
+static int tray_try_add_icon(void) {
+  if (g_tray == NULL || hwnd == NULL) {
+    return -1;
+  }
+
+  enum tray_log_level level = (icon_add_failures % TRAY_RETRY_LOG_PERIOD == 0) ? TRAY_LOG_WARNING : TRAY_LOG_DEBUG;
+  if (tray_add_notify_icon(g_tray, level) < 0) {
+    ++icon_add_failures;
+    icon_added = FALSE;
+    tray_schedule_icon_retry();
+    return -1;
+  }
+
+  if (icon_add_failures > 0) {
+    tray_log(TRAY_LOG_INFO, "Tray icon registered after %u failed attempts", icon_add_failures);
+  }
+  icon_add_failures = 0;
+  icon_added = TRUE;
+  KillTimer(hwnd, ID_TRAY_RETRY_TIMER);
+  tray_update(g_tray);
+  return 0;
+}
+
+// Explorer broadcasts TaskbarCreated at medium integrity. When this process runs
+// elevated (or as SYSTEM), UIPI silently drops that broadcast unless we opt in,
+// which would leave the icon permanently missing after an Explorer restart.
+static void tray_allow_taskbar_created(HWND wnd) {
+  typedef BOOL(WINAPI * change_window_message_filter_ex_t)(HWND, UINT, DWORD, void *);
+  HMODULE user32 = GetModuleHandleA("user32.dll");
+  if (user32 == NULL) {
+    return;
+  }
+  change_window_message_filter_ex_t change_filter =
+    (change_window_message_filter_ex_t) GetProcAddress(user32, "ChangeWindowMessageFilterEx");
+  if (change_filter == NULL) {
+    return;
+  }
+  if (!change_filter(wnd, wm_taskbarcreated, 1 /* MSGFLT_ALLOW */, NULL)) {
+    tray_log_last_error(TRAY_LOG_WARNING, "ChangeWindowMessageFilterEx(TaskbarCreated)");
+  }
+}
+
 static LRESULT CALLBACK _tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
   switch (msg) {
     case WM_CLOSE:
@@ -148,6 +213,16 @@ static LRESULT CALLBACK _tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARA
     case WM_DESTROY:
       PostQuitMessage(0);
       return 0;
+    case WM_TIMER:
+      if (wparam == ID_TRAY_RETRY_TIMER) {
+        if (icon_added) {
+          KillTimer(hwnd, ID_TRAY_RETRY_TIMER);
+        } else {
+          tray_try_add_icon();
+        }
+        return 0;
+      }
+      break;
     case WM_COMMAND: {
       if (HIWORD(wparam) == 0) {
         const UINT cmd_id = LOWORD(wparam);
@@ -200,18 +275,11 @@ static LRESULT CALLBACK _tray_wnd_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARA
     }
   }
 
-  // Handle Explorer restarts: re-add icon, set version, and re-apply state.
+  // Handle Explorer restarts: the old registration is gone, so re-add the icon
+  // and re-apply state (tray_try_add_icon keeps retrying on failure).
   if (msg == wm_taskbarcreated) {
-    if (g_tray && tray_add_notify_icon(g_tray, TRAY_LOG_WARNING) == 0) {
-      // Rebuild menu and re-apply state
-      UINT id = ID_TRAY_FIRST;
-      HMENU prevmenu = hmenu;
-      hmenu = _tray_menu(g_tray->menu, &id);
-      if (prevmenu) DestroyMenu(prevmenu);
-
-      extern void tray_update(struct tray *tray);
-      tray_update(g_tray);
-    }
+    icon_added = FALSE;
+    tray_try_add_icon();
     return 0;
   }
 
@@ -365,22 +433,19 @@ int tray_init(struct tray *tray) {
     return -1;
   }
   UpdateWindow(hwnd);
+  tray_allow_taskbar_created(hwnd);
 
   memset(&nid, 0, sizeof(nid));
   nid.cbSize = sizeof(NOTIFYICONDATAA);
   nid.hWnd = hwnd;
   nid.uID = 1; // non-zero id
 
-  if (tray_add_notify_icon(tray, TRAY_LOG_ERROR) < 0) {
-    DestroyWindow(hwnd);
-    hwnd = NULL;
-    _destroy_icon_cache();
-    g_tray = NULL;
-    UnregisterClassA(WC_TRAY_CLASS_NAME, GetModuleHandle(NULL));
-    return -1;
-  }
-
-  tray_update(tray);
+  // A rejected NIM_ADD is not fatal: keep the window and message loop alive so
+  // the retry timer and TaskbarCreated can register the icon once the shell is
+  // willing. Tearing down here would leave the tray permanently missing.
+  icon_added = FALSE;
+  icon_add_failures = 0;
+  tray_try_add_icon();
   return 0;
 }
 
@@ -417,6 +482,11 @@ void tray_update(struct tray *tray) {
   }
 
   g_tray = tray; // remember the last state for re-adding after Explorer restarts
+  if (!icon_added) {
+    // No icon registered yet; the retry path re-applies g_tray once NIM_ADD succeeds.
+    return;
+  }
+
   UINT id = ID_TRAY_FIRST;
   HMENU prevmenu = hmenu;
   hmenu = _tray_menu(tray->menu, &id);
@@ -465,6 +535,17 @@ void tray_update(struct tray *tray) {
   nid.uFlags = flags;
   if (!Shell_NotifyIconA(NIM_MODIFY, &nid)) {
     tray_log_last_error(TRAY_LOG_WARNING, "Shell_NotifyIconA(NIM_MODIFY)");
+    // The shell no longer has our icon (e.g. Explorer restarted without us seeing
+    // TaskbarCreated). Re-register it and re-apply this update.
+    icon_added = FALSE;
+    if (tray_add_notify_icon(tray, TRAY_LOG_WARNING) == 0) {
+      icon_added = TRUE;
+      nid.uFlags = flags;
+      Shell_NotifyIconA(NIM_MODIFY, &nid);
+    } else {
+      ++icon_add_failures;
+      tray_schedule_icon_retry();
+    }
   }
 
   if (prevmenu != NULL) {
@@ -477,9 +558,12 @@ void tray_exit(void) {
   Shell_NotifyIconA(NIM_DELETE, &nid);
   _destroy_icon_cache();
   if (hwnd != NULL) {
+    KillTimer(hwnd, ID_TRAY_RETRY_TIMER);
     DestroyWindow(hwnd);
     hwnd = NULL;
   }
+  icon_added = FALSE;
+  icon_add_failures = 0;
   if (hmenu != 0) {
     DestroyMenu(hmenu);
     hmenu = NULL;

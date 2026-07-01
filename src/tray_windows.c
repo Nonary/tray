@@ -27,6 +27,7 @@
 #define ID_TRAY_RETRY_TIMER 1  ///< Timer that retries notification icon registration.
 #define TRAY_RETRY_INTERVAL_MS 5000  ///< Interval between icon registration retries.
 #define TRAY_RETRY_LOG_PERIOD 60  ///< Log a retry failure at WARNING once per this many attempts.
+#define TRAY_NOTIFICATION_REPLAY_TTL_MS (3 * 60 * 1000)  ///< Replay a remembered notification after re-registration only within this window.
 
 /**
  * @brief Icon information.
@@ -57,11 +58,13 @@ static struct tray *g_tray = NULL;  // remember last tray so we can re-apply aft
 
 static BOOL icon_added = FALSE;  // whether the shell currently has our notification icon
 static unsigned int icon_add_failures = 0;
+static ULONGLONG notification_posted_ms = 0;  // GetTickCount64() when the app last posted notification text
 
 static struct icon_info *icon_infos;
 static HMENU _tray_menu(struct tray_menu *m, UINT *id);
 static HICON _fetch_icon(const char *path, enum IconType icon_type);
 static int tray_try_add_icon(void);
+static void tray_apply_state(struct tray *tray, BOOL is_replay);
 
 static tray_log_callback g_tray_log_cb = NULL;
 
@@ -182,7 +185,7 @@ static int tray_try_add_icon(void) {
   icon_add_failures = 0;
   icon_added = TRUE;
   KillTimer(hwnd, ID_TRAY_RETRY_TIMER);
-  tray_update(g_tray);
+  tray_apply_state(g_tray, TRUE);
   return 0;
 }
 
@@ -477,6 +480,13 @@ int tray_loop(int blocking) {
 }
 
 void tray_update(struct tray *tray) {
+  tray_apply_state(tray, FALSE);
+}
+
+// Applies the given state to the shell icon. is_replay marks re-registration
+// paths (TaskbarCreated, retry timer, NIM_MODIFY failure) that re-apply the
+// remembered g_tray rather than a fresh update from the app.
+static void tray_apply_state(struct tray *tray, BOOL is_replay) {
   if (tray == NULL || hwnd == NULL) {
     return;
   }
@@ -496,8 +506,23 @@ void tray_update(struct tray *tray) {
   DWORD flags = tray_apply_icon_and_tip(tray, NIF_MESSAGE);
 
   // Balloon/toast (legacy surface mapped to Win10+ toasts)
-  const BOOL has_title = (tray->notification_title && tray->notification_title[0]);
-  const BOOL has_text  = (tray->notification_text  && tray->notification_text[0]);
+  BOOL has_title = (tray->notification_title && tray->notification_title[0]);
+  BOOL has_text  = (tray->notification_text  && tray->notification_text[0]);
+  if (is_replay) {
+    // Re-registration re-applies the remembered state, and NIF_INFO would
+    // re-show the last toast. Taskbar hosts (DisplayFusion multi-monitor
+    // taskbars, Explorer restarts) broadcast TaskbarCreated on every taskbar
+    // rebuild, so an unexpired toast replayed each time reads as notification
+    // spam. Only replay while the toast is still fresh.
+    const BOOL fresh = notification_posted_ms != 0 &&
+                       GetTickCount64() - notification_posted_ms <= TRAY_NOTIFICATION_REPLAY_TTL_MS;
+    if (!fresh) {
+      has_title = FALSE;
+      has_text = FALSE;
+    }
+  } else {
+    notification_posted_ms = (has_title || has_text) ? GetTickCount64() : 0;
+  }
   if (has_title || has_text) {
     safe_copy_sz(nid.szInfoTitle, ARRAYSIZE(nid.szInfoTitle),
                  has_title ? tray->notification_title : "");
@@ -564,6 +589,7 @@ void tray_exit(void) {
   }
   icon_added = FALSE;
   icon_add_failures = 0;
+  notification_posted_ms = 0;
   if (hmenu != 0) {
     DestroyMenu(hmenu);
     hmenu = NULL;
